@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Job 1: lint, test, build, hash do bundle
+  # ─────────────────────────────────────────────────────────────
+  frontend:
+    name: Frontend (lint, test, build, hash)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck --if-present
+
+      - name: Unit tests
+        run: npm run test
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify committed bundle matches build
+        run: |
+          set -e
+          if [ ! -f dist/app.min.js ]; then
+            echo "::error::dist/app.min.js não foi gerado"
+            exit 1
+          fi
+          if [ ! -f supabase/app.min.js ]; then
+            echo "::error::supabase/app.min.js não existe no repo"
+            exit 1
+          fi
+          EXPECTED=$(sha256sum dist/app.min.js | cut -d' ' -f1)
+          ACTUAL=$(sha256sum supabase/app.min.js | cut -d' ' -f1)
+          echo "expected: $EXPECTED"
+          echo "actual:   $ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "::error::BUNDLE DRIFT — supabase/app.min.js não corresponde ao build"
+            exit 1
+          fi
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 2: banco — migrations aplicam em ambiente limpo + testes
+  # ─────────────────────────────────────────────────────────────
+database:
+    name: Database (migrations + SQL tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Start Supabase
+        run: supabase start
+
+      - name: Reset DB (migrations)
+        run: supabase db reset
+
+      - name: Reset DB with seed
+        run: supabase db reset --with-seed
+
+      - name: Get DB URL
+        id: db
+        run: echo "url=$(supabase status -o env | grep DB_URL | cut -d= -f2)" >> $GITHUB_OUTPUT
+
+      - name: Run SQL test suite
+        env:
+          SUPABASE_DB_URL: ${{ steps.db.outputs.url }}
+        run: |
+          set -e
+          for f in supabase/tests/*.sql; do
+            echo "▶ $f"
+            psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Verify no anon EXECUTE on mutating RPCs
+        run: |
+          set -e
+          supabase db execute --sql "
+            select proname, has_function_privilege('anon', oid, 'EXECUTE') as anon_exec
+            from pg_proc
+            where proname like 'app\_%' escape '\\'
+              and pronamespace = 'public'::regnamespace
+              and has_function_privilege('anon', oid, 'EXECUTE');
+          " | tee anon_exec.txt
+          if grep -q "app_" anon_exec.txt; then
+            echo "::error::RPC app_* concedida a anon"
+            exit 1
+          fi
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 3: teste de contrato client ↔ server
+  # ─────────────────────────────────────────────────────────────
+  contract:
+    name: Contract (bundle ↔ DB)
+    runs-on: ubuntu-latest
+    needs: [frontend, database]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Start Supabase
+        run: supabase start
+
+      - name: Run contract test
+        run: npm run test:contract
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 4: proibição de segredos
+  # ─────────────────────────────────────────────────────────────
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for service_role
+        run: |
+          set -e
+          if grep -r "service_role" supabase/ 2>/dev/null; then
+            echo "::error::'service_role' encontrado no client"
+            exit 1
+          fi
+          if grep -rE "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" supabase/ 2>/dev/null \
+             | grep -v "anon" ; then
+            echo "::warning::JWT detectado — verificar se é anon key"
+          fi
